@@ -7,6 +7,7 @@
  */
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 // Naive gather kernel: each thread copies one element
 __global__ void paged_gather_kernel(
@@ -714,6 +715,152 @@ extern "C" void launch_fused_paged_attention(
     int shared_mem_size = (head_dim + 2 * num_warps + num_warps * head_dim) * sizeof(float);
     fused_paged_attention_kernel<<<grid, threads, shared_mem_size>>>(
         query, k_cache, v_cache, output, block_table, context_lengths,
+        num_heads, block_size, head_dim, max_blocks_per_seq, scale
+    );
+}
+
+/*
+ * V2-FP16: Fused Paged Attention with FP16 KV Cache
+ *
+ * Same algorithm as V2, but KV cache and query are stored in half precision.
+ * Accumulation (dot products, softmax, output) stays in float32 for stability.
+ * This halves DRAM traffic for the memory-bound kernel.
+ */
+__global__ void fused_paged_attention_fp16_kernel(
+    const __half* __restrict__ query,
+    const __half* __restrict__ k_cache,
+    const __half* __restrict__ v_cache,
+    __half* __restrict__ output,
+    const int* __restrict__ block_table,
+    const int* __restrict__ context_lengths,
+    int num_heads,
+    int block_size,
+    int head_dim,
+    int max_blocks_per_seq,
+    float scale
+) {
+    int seq_id = blockIdx.x;
+    int head_id = blockIdx.y;
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    int num_warps = blockDim.x / 32;
+    int ctx_len = context_lengths[seq_id];
+
+    extern __shared__ float smem[];
+    float* q_shared = smem;  // query loaded as float for accumulation
+
+    // Load query into shared memory (convert half -> float)
+    const __half* q_ptr = query + seq_id * (num_heads * head_dim) + head_id * head_dim;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        q_shared[d] = __half2float(q_ptr[d]);
+    }
+    __syncthreads();
+
+    const int DIMS_PER_THREAD = 8;
+    float out_acc[DIMS_PER_THREAD];
+    int num_d = 0;
+    for (int d = lane_id; d < head_dim; d += 32) {
+        out_acc[num_d] = 0.0f;
+        num_d++;
+    }
+
+    float warp_max = -1e20f;
+    float warp_sum = 0.0f;
+
+    for (int token_idx = warp_id; token_idx < ctx_len; token_idx += num_warps) {
+        int logical_block = token_idx / block_size;
+        int offset_in_block = token_idx % block_size;
+        int physical_block = block_table[seq_id * max_blocks_per_seq + logical_block];
+        int block_base = physical_block * (num_heads * block_size * head_dim)
+                       + head_id * (block_size * head_dim);
+
+        const __half* k_ptr = k_cache + block_base + offset_in_block * head_dim;
+        float partial_dot = 0.0f;
+        for (int d = lane_id; d < head_dim; d += 32) {
+            partial_dot += q_shared[d] * __half2float(k_ptr[d]);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            partial_dot += __shfl_down_sync(0xffffffff, partial_dot, offset);
+        }
+        float score_val = __shfl_sync(0xffffffff, partial_dot, 0) * scale;
+
+        float new_max = fmaxf(warp_max, score_val);
+        float correction = expf(warp_max - new_max);
+        float exp_score = expf(score_val - new_max);
+        warp_sum = warp_sum * correction + exp_score;
+        warp_max = new_max;
+
+        const __half* v_ptr = v_cache + block_base + offset_in_block * head_dim;
+        int di = 0;
+        for (int d = lane_id; d < head_dim; d += 32) {
+            out_acc[di] = out_acc[di] * correction + exp_score * __half2float(v_ptr[d]);
+            di++;
+        }
+    }
+
+    // Merge warps (same as V2)
+    float* warp_maxes = smem + head_dim;
+    float* warp_sums = smem + head_dim + num_warps;
+    float* warp_outputs = smem + head_dim + 2 * num_warps;
+
+    int di = 0;
+    for (int d = lane_id; d < head_dim; d += 32) {
+        warp_outputs[warp_id * head_dim + d] = out_acc[di];
+        di++;
+    }
+    if (lane_id == 0) {
+        warp_maxes[warp_id] = warp_max;
+        warp_sums[warp_id] = warp_sum;
+    }
+    __syncthreads();
+
+    float global_max = -1e20f;
+    for (int w = 0; w < num_warps; w++) {
+        global_max = fmaxf(global_max, warp_maxes[w]);
+    }
+
+    __half* out_ptr = output + seq_id * (num_heads * head_dim) + head_id * head_dim;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int w = 0; w < num_warps; w++) {
+            float correction = expf(warp_maxes[w] - global_max);
+            acc += warp_outputs[w * head_dim + d] * correction;
+        }
+        // Store intermediate float result back to smem for normalization
+        warp_outputs[d] = acc;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        float total_sum = 0.0f;
+        for (int w = 0; w < num_warps; w++) {
+            total_sum += warp_sums[w] * expf(warp_maxes[w] - global_max);
+        }
+        smem[0] = total_sum;
+    }
+    __syncthreads();
+    float total_sum = smem[0];
+
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        out_ptr[d] = __float2half(warp_outputs[d] / total_sum);
+    }
+}
+
+// C interface for V2-FP16
+extern "C" void launch_fused_paged_attention_fp16(
+    const void* query, const void* k_cache, const void* v_cache,
+    void* output, const int* block_table, const int* context_lengths,
+    int num_seqs, int num_heads, int block_size, int head_dim,
+    int max_blocks_per_seq, float scale
+) {
+    dim3 grid(num_seqs, num_heads);
+    int threads = 256;
+    int num_warps = threads / 32;
+    int shared_mem_size = (head_dim + 2 * num_warps + num_warps * head_dim) * sizeof(float);
+    fused_paged_attention_fp16_kernel<<<grid, threads, shared_mem_size>>>(
+        (const __half*)query, (const __half*)k_cache, (const __half*)v_cache,
+        (__half*)output, block_table, context_lengths,
         num_heads, block_size, head_dim, max_blocks_per_seq, scale
     );
 }

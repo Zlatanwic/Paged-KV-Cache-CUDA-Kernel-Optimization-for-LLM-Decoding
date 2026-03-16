@@ -40,6 +40,13 @@ extern "C" void launch_fused_paged_attention_v3(
     int max_blocks_per_seq, float scale
 );
 
+extern "C" void launch_fused_paged_attention_fp16(
+    const void* query, const void* k_cache, const void* v_cache,
+    void* output, const int* block_table, const int* context_lengths,
+    int num_seqs, int num_heads, int block_size, int head_dim,
+    int max_blocks_per_seq, float scale
+);
+
 // Helper: prepare block_table and context_lengths on GPU
 static auto prepare_inputs(torch::Tensor block_table, torch::Tensor context_lengths,
                            torch::Device device) {
@@ -168,10 +175,34 @@ torch::Tensor paged_attention_v3(
     return output;
 }
 
+// V2-FP16: Fused paged attention with half-precision KV cache
+torch::Tensor paged_attention_v2_fp16(
+    torch::Tensor query, torch::Tensor k_cache, torch::Tensor v_cache,
+    torch::Tensor block_table, torch::Tensor context_lengths
+) {
+    int num_seqs = block_table.size(0);
+    int max_blocks_per_seq = block_table.size(1);
+    int num_heads = k_cache.size(1);
+    int block_size = k_cache.size(2);
+    int head_dim = k_cache.size(3);
+    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    auto output = torch::zeros({num_seqs, num_heads, head_dim}, query.options());
+    auto [bt, cl] = prepare_inputs(block_table, context_lengths, query.device());
+
+    launch_fused_paged_attention_fp16(query.data_ptr(),
+        k_cache.data_ptr(), v_cache.data_ptr(),
+        output.data_ptr(), bt.data_ptr<int>(), cl.data_ptr<int>(),
+        num_seqs, num_heads, block_size, head_dim, max_blocks_per_seq, scale);
+
+    return output;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("paged_gather", &paged_gather, "Gather K/V from paged cache");
     m.def("paged_attention_v1", &paged_attention_v1, "V1: gather + naive attention");
     m.def("paged_attention_v2", &paged_attention_v2, "V2: Fused, Layout A");
     m.def("paged_attention_v2_layout_b", &paged_attention_v2_layout_b, "V2-B: Fused, Layout B");
     m.def("paged_attention_v3", &paged_attention_v3, "V3: Fused + shared memory K, Layout A");
+    m.def("paged_attention_v2_fp16", &paged_attention_v2_fp16, "V2-FP16: Fused, half precision");
 }
